@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 
-const fs = require('fs');
+const { spawn } = require('child_process');
 const path = require('path');
-const readline = require('readline');
-const os = require('os');
-const { exec } = require('child_process');
+
+// Import modules
+const ConversationParser = require('./lib/parser');
+const ConversationAnalyzer = require('./lib/analyzer');
+const ReportVisualizer = require('./lib/visualizer');
+const ConfigManager = require('./lib/config');
+const ConversationMonitor = require('./lib/monitor');
+const SecurityUtils = require('./lib/security');
 
 // Claude API Pricing (per million tokens)
 const CLAUDE_PRICING = {
@@ -103,640 +108,358 @@ const CLAUDE_PRICING = {
   }
 };
 
-function calculateCost(usage, model) {
-  if (!usage) return 0;
+function displaySummary(analyzer, config) {
+  const stats = analyzer.getTotalStats();
+  const conversationsWithCosts = analyzer.getConversationsWithCosts();
+  const toolUsage = analyzer.aggregateToolUsage();
+  const modelUsage = analyzer.aggregateModelUsage();
+  const errorStats = analyzer.getErrorStats();
+  const sessionStats = analyzer.getSessionStats();
+  const tokenBurnStats = analyzer.getTokenBurnStats();
 
-  // Get pricing for the model, fallback to default
-  const pricing = CLAUDE_PRICING[model] || CLAUDE_PRICING['default'];
+  const currencySymbol = config.get('display.currencySymbol');
 
-  // Calculate costs for each token type (price per million tokens)
-  const inputCost = ((usage.input_tokens || 0) * pricing.input) / 1000000;
-  const outputCost = ((usage.output_tokens || 0) * pricing.output) / 1000000;
-  const cacheWriteCost = ((usage.cache_creation_input_tokens || 0) * pricing.cache_write) / 1000000;
-  const cacheReadCost = ((usage.cache_read_input_tokens || 0) * pricing.cache_read) / 1000000;
-
-  return inputCost + outputCost + cacheWriteCost + cacheReadCost;
-}
-
-async function parseJSONLFile(filePath) {
-  const fileStream = fs.createReadStream(filePath);
-  const rl = readline.createInterface({
-    input: fileStream,
-    crlfDelay: Infinity
+  console.log('\n=== Claude Conversation Cost Analysis ===\n');
+  
+  // Overall Stats
+  console.log(`Total Cost: ${currencySymbol}${stats.totalCost.toFixed(4)}`);
+  console.log(`Total Conversations: ${stats.conversationCount}`);
+  console.log(`Average Cost per Conversation: ${currencySymbol}${stats.averageCost.toFixed(4)}`);
+  console.log(`Total Tokens Used: ${formatNumber(stats.totalTokens)}`);
+  console.log(`Total Time: ${formatDuration(stats.totalDuration)}`);
+  
+  // Model Usage
+  console.log('\n=== Model Usage ===');
+  modelUsage.slice(0, 3).forEach(model => {
+    console.log(`${model.model}: ${currencySymbol}${model.totalCost.toFixed(4)} (${model.conversations} conversations)`);
   });
-
-  let totalCost = 0;
-  let messageCount = 0;
-  let conversationName = '';
-  let conversationTitle = '';
-  let startTime = null;
-  let endTime = null;
-  let summary = '';
-  let firstUserMessage = '';
-
-  for await (const line of rl) {
-    try {
-      const message = JSON.parse(line);
-
-      // Extract conversation metadata
-      if (message.type === 'summary') {
-        if (message.summary) {
-          summary = message.summary;
-        }
-        if (message.metadata) {
-          conversationName = message.metadata.workingDirectory || message.metadata.cwd || 'Unknown';
-          if (message.metadata.thread_summary) {
-            conversationTitle = message.metadata.thread_summary;
-          }
-          if (message.metadata.summary) {
-            conversationTitle = message.metadata.summary;
-          }
-        }
-      }
-
-      // Capture first user message as fallback title
-      if (message.type === 'user' && !firstUserMessage && message.text) {
-        firstUserMessage = message.text.substring(0, 100);
-      }
-
-      // Extract cost data from assistant messages
-      if (message.type === 'assistant' && message.message) {
-        const usage = message.message.usage;
-        const model = message.message.model;
-        if (usage && model) {
-          const cost = calculateCost(usage, model);
-          totalCost += cost;
-          messageCount++;
-        }
-      }
-
-      // Track conversation time range - FIXED: use timestamp field
-      if (message.timestamp) {
-        const timestamp = new Date(message.timestamp);
-        if (!startTime || timestamp < startTime) startTime = timestamp;
-        if (!endTime || timestamp > endTime) endTime = timestamp;
-      }
-    } catch (e) {
-      // Silent error handling
-    }
-  }
-
-  // Determine best title
-  if (!conversationTitle) {
-    conversationTitle = summary || firstUserMessage || 'Untitled conversation';
-  }
-
-  return {
-    conversationId: path.basename(filePath, '.jsonl'),
-    conversationName,
-    conversationTitle: conversationTitle.replace(/\n/g, ' ').substring(0, 100),
-    totalCost,
-    messageCount,
-    startTime,
-    endTime,
-    duration: endTime && startTime ? (endTime - startTime) / 1000 / 60 : 0 // in minutes
-  };
-}
-
-async function analyzeAllConversations() {
-  const claudeProjectsDir = path.join(process.env.HOME, '.claude', 'projects');
-
-  if (!fs.existsSync(claudeProjectsDir)) {
-    console.error('Claude projects directory not found:', claudeProjectsDir);
-    return [];
-  }
-
-  const conversations = [];
-
-  // Get all project directories
-  const projectDirs = fs
-    .readdirSync(claudeProjectsDir)
-    .filter(dir => fs.statSync(path.join(claudeProjectsDir, dir)).isDirectory());
-
-  let processedCount = 0;
-  const totalFiles = projectDirs.reduce((acc, dir) => {
-    const projectPath = path.join(claudeProjectsDir, dir);
-    return acc + fs.readdirSync(projectPath).filter(f => f.endsWith('.jsonl')).length;
-  }, 0);
-
-  for (const projectDir of projectDirs) {
-    const projectPath = path.join(claudeProjectsDir, projectDir);
-    const jsonlFiles = fs.readdirSync(projectPath).filter(file => file.endsWith('.jsonl'));
-
-    for (const jsonlFile of jsonlFiles) {
-      const filePath = path.join(projectPath, jsonlFile);
-      processedCount++;
-      process.stdout.write(`\rProcessing: ${processedCount}/${totalFiles} files...`);
-
-      try {
-        const conversation = await parseJSONLFile(filePath);
-        conversation.projectName = projectDir;
-        conversations.push(conversation);
-      } catch (e) {
-        // Silent error handling
-      }
-    }
-  }
-
-  console.log('\n'); // New line after progress
-  return conversations;
-}
-
-function aggregateDailyCosts(conversations) {
-  const dailyCosts = {};
-
-  conversations.forEach(conv => {
-    if (conv.totalCost > 0 && conv.startTime) {
-      const dateKey = conv.startTime.toISOString().split('T')[0];
-      if (!dailyCosts[dateKey]) {
-        dailyCosts[dateKey] = {
-          date: dateKey,
-          totalCost: 0,
-          conversationCount: 0,
-          conversations: []
-        };
-      }
-      dailyCosts[dateKey].totalCost += conv.totalCost;
-      dailyCosts[dateKey].conversationCount += 1;
-      dailyCosts[dateKey].conversations.push(conv);
-    }
+  
+  // Tool Usage
+  console.log('\n=== Top Tool Usage ===');
+  toolUsage.slice(0, 5).forEach(tool => {
+    console.log(`${tool.name}: ${tool.totalCount} uses, ${currencySymbol}${tool.totalCost.toFixed(4)}`);
   });
-
-  // Convert to array and sort by date
-  return Object.values(dailyCosts).sort((a, b) => a.date.localeCompare(b.date));
-}
-
-function getLast30Days() {
-  const days = [];
-  const today = new Date();
-
-  for (let i = 29; i >= 0; i--) {
-    const date = new Date(today);
-    date.setDate(date.getDate() - i);
-    days.push(date.toISOString().split('T')[0]);
+  
+  // Error Stats
+  if (errorStats.totalErrors > 0) {
+    console.log(`\n=== Error Statistics ===`);
+    console.log(`Total Errors: ${errorStats.totalErrors} (${(errorStats.errorRate * 100).toFixed(1)}% of conversations)`);
   }
-
-  return days;
-}
-
-function createHTMLReport(conversations) {
-  const conversationsWithCosts = conversations
-    .filter(c => c.totalCost > 0)
-    .sort((a, b) => b.totalCost - a.totalCost);
-
-  const totalCost = conversationsWithCosts.reduce((sum, c) => sum + c.totalCost, 0);
-
-  // Get unique projects for filter
-  const uniqueProjects = [...new Set(conversationsWithCosts.map(c => c.projectName))];
-
-  // Get daily data
-  const dailyData = aggregateDailyCosts(conversations);
-  const last30Days = getLast30Days();
-
-  // Fill in missing days with zero cost
-  const dailyCostMap = {};
-  dailyData.forEach(d => {
-    dailyCostMap[d.date] = {
-      cost: d.totalCost,
-      conversations: d.conversations
-    };
-  });
-
-  const last30DaysData = last30Days.map(date => ({
-    date,
-    cost: dailyCostMap[date]?.cost || 0,
-    conversations: dailyCostMap[date]?.conversations || []
-  }));
-
-  // Prepare data for top conversations chart
-  const chartData = conversationsWithCosts.slice(0, 20).map(c => ({
-    label: c.conversationTitle || c.conversationName.split('/').pop() || 'Unknown',
-    cost: c.totalCost,
-    date: c.startTime ? c.startTime.toLocaleDateString() : 'Unknown',
-    projectName: c.projectName
-  }));
-
-  const html = `<!DOCTYPE html>
-<html>
-<head>
-    <title>Claude Code Conversation Cost Analysis</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/date-fns@2.29.3/index.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 20px;
-            background-color: #f5f5f5;
-        }
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            background-color: white;
-            padding: 20px;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        h1 {
-            color: #333;
-            text-align: center;
-        }
-        .summary {
-            display: flex;
-            justify-content: space-around;
-            margin: 20px 0;
-            text-align: center;
-        }
-        .summary-item {
-            padding: 20px;
-            background-color: #f8f9fa;
-            border-radius: 8px;
-            flex: 1;
-            margin: 0 10px;
-        }
-        .summary-value {
-            font-size: 2em;
-            font-weight: bold;
-            color: #007bff;
-        }
-        .chart-container {
-            position: relative;
-            height: 400px;
-            margin: 30px 0;
-        }
-        .daily-chart-container {
-            position: relative;
-            height: 300px;
-            margin: 30px 0;
-        }
-        .filter-container {
-            margin: 20px 0;
-            padding: 15px;
-            background-color: #f8f9fa;
-            border-radius: 8px;
-        }
-        .filter-container label {
-            margin-right: 10px;
-            font-weight: bold;
-        }
-        .filter-container select {
-            padding: 5px 10px;
-            border-radius: 4px;
-            border: 1px solid #ddd;
-            margin-right: 20px;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 20px;
-        }
-        th, td {
-            text-align: left;
-            padding: 12px;
-            border-bottom: 1px solid #ddd;
-        }
-        th {
-            background-color: #f8f9fa;
-            font-weight: bold;
-        }
-        tr:hover {
-            background-color: #f5f5f5;
-        }
-        .cost {
-            font-weight: bold;
-            color: #28a745;
-        }
-        .conversation-title {
-            max-width: 400px;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
-        .clickable {
-            cursor: pointer;
-            text-decoration: underline;
-            color: #007bff;
-        }
-        .clickable:hover {
-            color: #0056b3;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Claude Conversation Cost Analysis</h1>
-        
-        <div class="summary">
-            <div class="summary-item">
-                <div>Total Cost</div>
-                <div class="summary-value">$${totalCost.toFixed(4)}</div>
-            </div>
-            <div class="summary-item">
-                <div>Total Conversations</div>
-                <div class="summary-value">${conversationsWithCosts.length}</div>
-            </div>
-            <div class="summary-item">
-                <div>Average Cost</div>
-                <div class="summary-value">$${(totalCost / conversationsWithCosts.length).toFixed(
-                  4
-                )}</div>
-            </div>
-        </div>
-
-        <div class="filter-container">
-            <label for="projectFilter">Filter by Project:</label>
-            <select id="projectFilter">
-                <option value="all">All Projects</option>
-                ${uniqueProjects
-                  .map(p => `<option value="${p}">${p.replace(/-Users-philipp-dev-/, '')}</option>`)
-                  .join('')}
-            </select>
-        </div>
-
-        <h2>Daily Cost Breakdown (Last 30 Days)</h2>
-        <div class="daily-chart-container">
-            <canvas id="dailyChart"></canvas>
-        </div>
-
-        <h2>Top 20 Most Expensive Conversations</h2>
-        <div class="chart-container">
-            <canvas id="costChart"></canvas>
-        </div>
-
-        <table id="conversationTable">
-            <thead>
-                <tr>
-                    <th>Conversation Title</th>
-                    <th>Project</th>
-                    <th>Cost</th>
-                    <th>Messages</th>
-                    <th>Duration</th>
-                    <th>Date</th>
-                </tr>
-            </thead>
-            <tbody>
-                ${conversationsWithCosts
-                  .slice(0, 20)
-                  .map(
-                    conv => `
-                    <tr data-project="${conv.projectName}">
-                        <td class="conversation-title" title="${
-                          conv.conversationTitle
-                        }">${conv.conversationTitle}</td>
-                        <td>${conv.conversationName.split('/').pop() || conv.projectName}</td>
-                        <td class="cost">$${conv.totalCost.toFixed(6)}</td>
-                        <td>${conv.messageCount}</td>
-                        <td>${conv.duration.toFixed(1)} min</td>
-                        <td>${conv.startTime ? conv.startTime.toLocaleDateString() : 'Unknown'}</td>
-                    </tr>
-                `
-                  )
-                  .join('')}
-            </tbody>
-        </table>
-    </div>
-
-    <script>
-        // Store all conversation data for filtering
-        const allConversations = ${JSON.stringify(conversationsWithCosts)};
-        const dailyDataByProject = ${JSON.stringify(last30DaysData)};
-        
-        // Daily cost chart
-        const dailyCtx = document.getElementById('dailyChart').getContext('2d');
-        const dailyChart = new Chart(dailyCtx, {
-            type: 'line',
-            data: {
-                labels: ${JSON.stringify(last30DaysData.map(d => d.date))},
-                datasets: [{
-                    label: 'Daily Cost (USD)',
-                    data: ${JSON.stringify(last30DaysData.map(d => d.cost))},
-                    backgroundColor: 'rgba(54, 162, 235, 0.2)',
-                    borderColor: 'rgba(54, 162, 235, 1)',
-                    borderWidth: 2,
-                    fill: true,
-                    tension: 0.1
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                interaction: {
-                    mode: 'index',
-                    intersect: false,
-                },
-                scales: {
-                    x: {
-                        type: 'time',
-                        time: {
-                            unit: 'day',
-                            displayFormats: {
-                                day: 'MMM d'
-                            }
-                        }
-                    },
-                    y: {
-                        beginAtZero: true,
-                        ticks: {
-                            callback: function(value) {
-                                return '$' + value.toFixed(2);
-                            }
-                        }
-                    }
-                },
-                plugins: {
-                    tooltip: {
-                        callbacks: {
-                            label: function(context) {
-                                const dayData = dailyDataByProject[context.dataIndex];
-                                const lines = ['Cost: $' + context.parsed.y.toFixed(4)];
-                                if (dayData && dayData.conversations.length > 0) {
-                                    lines.push('Conversations: ' + dayData.conversations.length);
-                                    lines.push('---');
-                                    dayData.conversations.slice(0, 3).forEach(conv => {
-                                        lines.push(conv.conversationTitle.substring(0, 40) + '...: $' + conv.totalCost.toFixed(2));
-                                    });
-                                    if (dayData.conversations.length > 3) {
-                                        lines.push('... and ' + (dayData.conversations.length - 3) + ' more');
-                                    }
-                                }
-                                return lines;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        // Top conversations chart
-        const ctx = document.getElementById('costChart').getContext('2d');
-        const conversationChart = new Chart(ctx, {
-            type: 'bar',
-            data: {
-                labels: ${JSON.stringify(
-                  chartData.map(c => c.label.substring(0, 50) + (c.label.length > 50 ? '...' : ''))
-                )},
-                datasets: [{
-                    label: 'Cost (USD)',
-                    data: ${JSON.stringify(chartData.map(c => c.cost))},
-                    backgroundColor: 'rgba(54, 162, 235, 0.8)',
-                    borderColor: 'rgba(54, 162, 235, 1)',
-                    borderWidth: 1
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                indexAxis: 'y',
-                scales: {
-                    x: {
-                        beginAtZero: true,
-                        ticks: {
-                            callback: function(value) {
-                                return '$' + value.toFixed(4);
-                            }
-                        }
-                    },
-                    y: {
-                        ticks: {
-                            autoSkip: false,
-                            font: {
-                                size: 11
-                            }
-                        }
-                    }
-                },
-                plugins: {
-                    tooltip: {
-                        callbacks: {
-                            label: function(context) {
-                                return 'Cost: $' + context.parsed.x.toFixed(6);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        // Project filter functionality
-        document.getElementById('projectFilter').addEventListener('change', function(e) {
-            const selectedProject = e.target.value;
-            
-            // Filter conversations
-            let filteredConversations = allConversations;
-            if (selectedProject !== 'all') {
-                filteredConversations = allConversations.filter(c => c.projectName === selectedProject);
-            }
-            
-            // Update summary
-            const totalCost = filteredConversations.reduce((sum, c) => sum + c.totalCost, 0);
-            document.querySelector('.summary-value').textContent = '$' + totalCost.toFixed(4);
-            document.querySelectorAll('.summary-value')[1].textContent = filteredConversations.length;
-            document.querySelectorAll('.summary-value')[2].textContent = '$' + (totalCost / filteredConversations.length).toFixed(4);
-            
-            // Update daily chart
-            const filteredDailyData = dailyDataByProject.map(day => {
-                const filteredDayConversations = selectedProject === 'all' 
-                    ? day.conversations 
-                    : day.conversations.filter(c => c.projectName === selectedProject);
-                
-                return {
-                    date: day.date,
-                    cost: filteredDayConversations.reduce((sum, c) => sum + c.totalCost, 0)
-                };
-            });
-            
-            dailyChart.data.datasets[0].data = filteredDailyData.map(d => d.cost);
-            dailyChart.update();
-            
-            // Update conversation chart
-            const topFiltered = filteredConversations.slice(0, 20);
-            conversationChart.data.labels = topFiltered.map(c => {
-                const label = c.conversationTitle || c.conversationName.split('/').pop() || 'Unknown';
-                return label.substring(0, 50) + (label.length > 50 ? '...' : '');
-            });
-            conversationChart.data.datasets[0].data = topFiltered.map(c => c.totalCost);
-            conversationChart.update();
-            
-            // Update table
-            const tbody = document.querySelector('#conversationTable tbody');
-            tbody.innerHTML = topFiltered.map(conv => \`
-                <tr data-project="\${conv.projectName}">
-                    <td class="conversation-title" title="\${conv.conversationTitle}">\${conv.conversationTitle}</td>
-                    <td>\${conv.conversationName.split('/').pop() || conv.projectName}</td>
-                    <td class="cost">$\${conv.totalCost.toFixed(6)}</td>
-                    <td>\${conv.messageCount}</td>
-                    <td>\${conv.duration.toFixed(1)} min</td>
-                    <td>\${conv.startTime ? conv.startTime.toLocaleDateString() : 'Unknown'}</td>
-                </tr>
-            \`).join('');
-        });
-    </script>
-</body>
-</html>`;
-
-  const outputPath = path.join(os.tmpdir(), `claude-costs-report-${Date.now()}.html`);
-  fs.writeFileSync(outputPath, html);
-  console.log(`\nHTML report generated: ${outputPath}`);
-  return outputPath;
-}
-
-function displaySummary(conversations) {
-  const conversationsWithCosts = conversations.filter(c => c.totalCost > 0);
-  const totalCost = conversationsWithCosts.reduce((sum, c) => sum + c.totalCost, 0);
-
-  console.log('\n=== Claude Conversation Cost Summary ===\n');
-  console.log(`Total Cost: $${totalCost.toFixed(4)}`);
-  console.log(`Total Conversations: ${conversationsWithCosts.length}`);
-  console.log(
-    `Average Cost per Conversation: $${(totalCost / conversationsWithCosts.length).toFixed(4)}`
-  );
-
-  // Show top 5 with titles
-  console.log('\nTop 5 Most Expensive Conversations:');
+  
+  // Token Burn Stats
+  console.log(`\n=== Token Burn Analysis ===`);
+  console.log(`Average Burn Rate: ${tokenBurnStats.averageBurnRate.toFixed(0)} tokens/minute`);
+  console.log(`Maximum Burn Rate: ${tokenBurnStats.maxBurnRate.toFixed(0)} tokens/minute`);
+  
+  // Top 5 Most Expensive Conversations
+  console.log('\n=== Top 5 Most Expensive Conversations ===');
   conversationsWithCosts
-    .sort((a, b) => b.totalCost - a.totalCost)
     .slice(0, 5)
     .forEach((conv, i) => {
       console.log(`${i + 1}. ${conv.conversationTitle}`);
       console.log(`   Project: ${conv.conversationName.split('/').pop() || conv.projectName}`);
-      console.log(`   Cost: $${conv.totalCost.toFixed(6)}`);
+      console.log(`   Cost: ${currencySymbol}${conv.totalCost.toFixed(6)}`);
+      console.log(`   Tokens: ${formatNumber(conv.totalTokens.total)}`);
+      console.log(`   Duration: ${formatDuration(conv.duration)}`);
       console.log(`   Date: ${conv.startTime ? conv.startTime.toLocaleDateString() : 'Unknown'}`);
     });
+  
+  // Check for alerts
+  const todaysCost = analyzer.aggregateDailyCosts()
+    .filter(d => d.date === new Date().toISOString().split('T')[0])
+    .reduce((sum, d) => sum + d.totalCost, 0);
+  
+  const alerts = config.checkAlerts({
+    dailyCost: todaysCost,
+    sessionCost: conversationsWithCosts[0]?.totalCost || 0,
+    tokenBurnRate: tokenBurnStats.maxBurnRate
+  });
+  
+  if (alerts.length > 0) {
+    console.log('\n=== ⚠️  ALERTS ===');
+    alerts.forEach(alert => {
+      console.log(`${alert.severity.toUpperCase()}: ${alert.message}`);
+    });
+  }
+}
+
+function formatNumber(num) {
+  if (num >= 1000000) {
+    return (num / 1000000).toFixed(1) + 'M';
+  } else if (num >= 1000) {
+    return (num / 1000).toFixed(1) + 'K';
+  }
+  return num.toFixed(0);
+}
+
+function formatDuration(minutes) {
+  if (minutes < 60) {
+    return minutes.toFixed(0) + ' minutes';
+  } else if (minutes < 1440) {
+    return (minutes / 60).toFixed(1) + ' hours';
+  } else {
+    return (minutes / 1440).toFixed(1) + ' days';
+  }
+}
+
+// Parse command line arguments
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const options = {
+    monitor: false,
+    export: null,
+    project: null,
+    days: 30,
+    help: false
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    switch (args[i]) {
+      case '--monitor':
+      case '-m':
+        options.monitor = true;
+        break;
+      case '--export':
+      case '-e':
+        const format = args[++i];
+        if (!format || !['html', 'csv', 'json'].includes(format.toLowerCase())) {
+          console.error('Invalid export format. Use: html, csv, or json');
+          process.exit(1);
+        }
+        options.export = format.toLowerCase();
+        break;
+      case '--project':
+      case '-p':
+        const project = args[++i];
+        if (!project) {
+          console.error('Project name required for --project option');
+          process.exit(1);
+        }
+        // Sanitize project name to prevent injection
+        options.project = project.replace(/[^a-zA-Z0-9._-]/g, '');
+        break;
+      case '--days':
+      case '-d':
+        try {
+          const days = SecurityUtils.validateNumber(args[++i], 1, 365);
+          options.days = days;
+        } catch (error) {
+          console.error('Invalid days value. Must be between 1 and 365');
+          process.exit(1);
+        }
+        break;
+      case '--help':
+      case '-h':
+        options.help = true;
+        break;
+      default:
+        console.error(`Unknown option: ${args[i]}`);
+        console.log('Use --help for usage information');
+        process.exit(1);
+    }
+  }
+
+  return options;
+}
+
+function showHelp() {
+  console.log(`
+Claude Code Cost Analyzer - Enhanced Edition
+
+Usage: npx claude-code-costs [options]
+
+Options:
+  -m, --monitor          Enable real-time monitoring mode
+  -e, --export <format>  Export data (formats: html, csv, json)
+  -p, --project <name>   Filter by project name
+  -d, --days <number>    Number of days to analyze (default: 30)
+  -h, --help            Show this help message
+
+Examples:
+  npx claude-code-costs                    # Generate HTML report
+  npx claude-code-costs --monitor          # Start real-time monitoring
+  npx claude-code-costs --export csv       # Export to CSV
+  npx claude-code-costs --project myapp    # Analyze specific project
+
+Configuration:
+  Settings are stored in ~/.claude-code-costs/config.json
+  Edit this file to customize alerts, display options, and more.
+`);
 }
 
 // Main execution
 async function main() {
-  console.log('Analyzing Claude conversation costs...\n');
+  const options = parseArgs();
 
-  const conversations = await analyzeAllConversations();
+  if (options.help) {
+    showHelp();
+    return;
+  }
+
+  console.log('🔍 Analyzing Claude conversation costs...\n');
+
+  // Initialize components
+  const configManager = new ConfigManager();
+  const parser = new ConversationParser(CLAUDE_PRICING);
+  const analyzer = new ConversationAnalyzer();
+  const visualizer = new ReportVisualizer(configManager);
+  const monitor = new ConversationMonitor(configManager);
+
+  // Load and analyze conversations
+  const conversations = await analyzer.analyzeAllConversations(parser);
 
   if (conversations.length === 0) {
     console.log('No conversations found.');
     return;
   }
 
-  displaySummary(conversations);
-  const reportPath = createHTMLReport(conversations);
-
-  console.log('\nOpening report in browser...');
-
-  // Open the HTML file in the default browser
-  const platform = process.platform;
-  let cmd;
-  if (platform === 'darwin') {
-    cmd = `open "${reportPath}"`;
-  } else if (platform === 'win32') {
-    cmd = `start "" "${reportPath}"`;
-  } else {
-    cmd = `xdg-open "${reportPath}"`;
+  // Apply filters if specified
+  if (options.project) {
+    analyzer.conversations = analyzer.conversations.filter(
+      c => c.projectName.includes(options.project)
+    );
   }
 
-  exec(cmd, err => {
-    if (err) {
+  if (options.days < 365) {
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - options.days);
+    analyzer.conversations = analyzer.conversations.filter(
+      c => c.startTime && c.startTime >= cutoffDate
+    );
+  }
+
+  // Display summary
+  displaySummary(analyzer, configManager);
+
+  // Handle different modes
+  if (options.monitor) {
+    console.log('\n🔄 Starting real-time monitoring...');
+    console.log('Press Ctrl+C to stop\n');
+
+    monitor.on('session-updated', (data) => {
+      console.log(`\n📊 Active Session Update:`);
+      console.log(`   Session: ${data.sessionId}`);
+      console.log(`   Cost: $${data.session.totalCost.toFixed(4)}`);
+      console.log(`   Tokens: ${data.session.totalTokens}`);
+      console.log(`   Burn Rate: ${data.session.avgBurnRate.toFixed(0)} tokens/min`);
+    });
+
+    monitor.on('alerts', (alerts) => {
+      console.log(`\n⚠️  ALERTS:`);
+      alerts.forEach(alert => {
+        console.log(`   ${alert.severity.toUpperCase()}: ${alert.message}`);
+      });
+    });
+
+    monitor.startMonitoring();
+
+    // Keep the process running
+    process.on('SIGINT', () => {
+      console.log('\n\nStopping monitor...');
+      monitor.stopMonitoring();
+      process.exit(0);
+    });
+
+  } else if (options.export) {
+    console.log(`\n📁 Exporting data as ${options.export}...`);
+    
+    switch (options.export) {
+      case 'csv':
+        exportCSV(analyzer, configManager);
+        break;
+      case 'json':
+        exportJSON(analyzer, configManager);
+        break;
+      default:
+        console.log('Unsupported export format. Use: csv, json');
+    }
+
+  } else {
+    // Generate HTML report
+    const reportPath = visualizer.generateReport(analyzer, monitor);
+    console.log(`\n📊 HTML report generated: ${reportPath}`);
+    console.log('Opening report in browser...');
+
+    // Open the HTML file in the default browser (secure implementation)
+    const platform = process.platform;
+    let openCommand;
+    let args = [];
+    
+    if (platform === 'darwin') {
+      openCommand = 'open';
+      args = [reportPath];
+    } else if (platform === 'win32') {
+      openCommand = 'cmd.exe';
+      args = ['/c', 'start', '""', reportPath];
+    } else {
+      openCommand = 'xdg-open';
+      args = [reportPath];
+    }
+
+    const child = spawn(openCommand, args, {
+      detached: true,
+      stdio: 'ignore'
+    });
+
+    child.on('error', (err) => {
       console.error('Failed to open browser automatically.');
       console.log(`Please open the following file manually: ${reportPath}`);
-    }
+    });
+
+    child.unref();
+  }
+}
+
+function exportCSV(analyzer, config) {
+  const fs = require('fs');
+  const conversations = analyzer.getConversationsWithCosts();
+  const currencySymbol = config.get('display.currencySymbol');
+  
+  const headers = ['Title', 'Project', 'Cost', 'Tokens', 'Messages', 'Duration', 'Date', 'Top Tools'];
+  const rows = conversations.map(c => {
+    const topTools = Object.entries(c.toolUsage)
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, 3)
+      .map(([tool, data]) => `${tool}(${data.count})`)
+      .join(', ');
+    
+    return [
+      c.conversationTitle,
+      c.projectName,
+      c.totalCost.toFixed(6),
+      c.totalTokens.total,
+      c.messageCount,
+      c.duration.toFixed(1),
+      c.startTime ? c.startTime.toISOString() : '',
+      topTools
+    ];
   });
+  
+  const csv = [headers, ...rows].map(row => row.map(cell => `"${cell}"`).join(',')).join('\n');
+  const filename = `claude-costs-export-${Date.now()}.csv`;
+  fs.writeFileSync(filename, csv);
+  console.log(`CSV exported to: ${filename}`);
+}
+
+function exportJSON(analyzer, config) {
+  const fs = require('fs');
+  const data = {
+    metadata: {
+      exportDate: new Date().toISOString(),
+      version: '2.0.0',
+      config: config.config
+    },
+    summary: analyzer.getTotalStats(),
+    conversations: analyzer.getConversationsWithCosts(),
+    toolUsage: analyzer.aggregateToolUsage(),
+    modelUsage: analyzer.aggregateModelUsage(),
+    dailyCosts: analyzer.aggregateDailyCosts(),
+    projectStats: analyzer.getProjectStats()
+  };
+  
+  const filename = `claude-costs-export-${Date.now()}.json`;
+  fs.writeFileSync(filename, JSON.stringify(data, null, 2));
+  console.log(`JSON exported to: ${filename}`);
 }
 
 main().catch(console.error);

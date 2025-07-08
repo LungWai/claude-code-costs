@@ -1,0 +1,36 @@
+{
+  "alerts": {
+    "enabled": true,
+    "dailyCostThreshold": 10.0,
+    "sessionCostThreshold": 2.0,
+    "tokenBurnRateThreshold": 10000,
+    "soundEnabled": false
+  },
+  "display": {
+    "currency": "USD",
+    "currencySymbol": "$",
+    "dateFormat": "MM/DD/YYYY",
+    "timeFormat": "12h",
+    "theme": "light",
+    "chartAnimations": true
+  },
+  "export": {
+    "defaultFormat": "html",
+    "includeRawData": false,
+    "compressOutput": false
+  },
+  "monitoring": {
+    "autoRefresh": false,
+    "refreshInterval": 300,
+    "showNotifications": true
+  },
+  "filters": {
+    "defaultDateRange": 30,
+    "excludeZeroCostConversations": true,
+    "minConversationDuration": 0
+  },
+  "pricing": {
+    "customPricing": {},
+    "useCachedPricing": true
+  }
+}

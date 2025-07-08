@@ -1,19 +1,27 @@
 {
   "name": "claude-code-costs",
-  "version": "1.0.1",
-  "description": "Analyze Claude Code conversation costs with interactive visualizations",
+  "version": "2.0.0",
+  "description": "Comprehensive Claude Code cost analyzer with real-time monitoring, tool usage analytics, and advanced visualizations",
   "main": "index.js",
   "bin": {
     "claude-code-costs": "./index.js"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node index.js",
+    "monitor": "node index.js --monitor"
   },
   "keywords": [
     "claude",
+    "claude-code",
     "costs",
     "analysis",
-    "visualization"
+    "visualization",
+    "monitoring",
+    "token-usage",
+    "tool-analytics",
+    "real-time",
+    "dashboard"
   ],
   "author": "",
   "license": "MIT",
